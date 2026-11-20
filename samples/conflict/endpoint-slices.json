@@ -1,0 +1,145 @@
+{
+  "apiVersion": "discovery.k8s.io/v1",
+  "kind": "EndpointSliceList",
+  "items": [
+    {
+      "apiVersion": "discovery.k8s.io/v1",
+      "kind": "EndpointSlice",
+      "metadata": {
+        "name": "web-lb-http-a",
+        "namespace": "shop",
+        "labels": {
+          "kubernetes.io/service-name": "web-lb"
+        }
+      },
+      "addressType": "IPv4",
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "protocol": "TCP"
+        }
+      ],
+      "endpoints": [
+        {
+          "addresses": [
+            "10.0.1.41"
+          ],
+          "nodeName": "node-a",
+          "conditions": {
+            "ready": true,
+            "serving": true,
+            "terminating": false
+          }
+        },
+        {
+          "addresses": [
+            "10.0.2.41"
+          ],
+          "nodeName": "node-b",
+          "conditions": {
+            "ready": true,
+            "serving": true,
+            "terminating": false
+          }
+        }
+      ]
+    },
+    {
+      "apiVersion": "discovery.k8s.io/v1",
+      "kind": "EndpointSlice",
+      "metadata": {
+        "name": "web-lb-http-b",
+        "namespace": "shop",
+        "labels": {
+          "kubernetes.io/service-name": "web-lb"
+        }
+      },
+      "addressType": "IPv4",
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "protocol": "TCP"
+        }
+      ],
+      "endpoints": [
+        {
+          "addresses": [
+            "10.0.1.41"
+          ],
+          "nodeName": "node-a",
+          "conditions": {
+            "ready": false,
+            "serving": true,
+            "terminating": true
+          }
+        }
+      ]
+    },
+    {
+      "apiVersion": "discovery.k8s.io/v1",
+      "kind": "EndpointSlice",
+      "metadata": {
+        "name": "web-lb-metrics-a",
+        "namespace": "shop",
+        "labels": {
+          "kubernetes.io/service-name": "web-lb"
+        }
+      },
+      "addressType": "IPv4",
+      "ports": [
+        {
+          "name": "metrics-port",
+          "port": 9101,
+          "protocol": "TCP"
+        }
+      ],
+      "endpoints": [
+        {
+          "addresses": [
+            "10.0.1.41"
+          ],
+          "nodeName": "node-a",
+          "conditions": {
+            "ready": true,
+            "serving": true,
+            "terminating": false
+          }
+        }
+      ]
+    },
+    {
+      "apiVersion": "discovery.k8s.io/v1",
+      "kind": "EndpointSlice",
+      "metadata": {
+        "name": "web-lb-metrics-b",
+        "namespace": "shop",
+        "labels": {
+          "kubernetes.io/service-name": "web-lb"
+        }
+      },
+      "addressType": "IPv4",
+      "ports": [
+        {
+          "name": "metrics-port",
+          "port": 9102,
+          "protocol": "TCP"
+        }
+      ],
+      "endpoints": [
+        {
+          "addresses": [
+            "10.0.2.41"
+          ],
+          "nodeName": "node-b",
+          "conditions": {
+            "ready": true,
+            "serving": true,
+            "terminating": false
+          }
+        }
+      ]
+    }
+  ]
+}

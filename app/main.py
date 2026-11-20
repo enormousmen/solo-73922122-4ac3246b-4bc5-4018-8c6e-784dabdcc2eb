@@ -1,21 +1,36 @@
-"""FastAPI 入口：上传 NodeList/PodList 快照，勾选节点并试算缩容落点。"""
+"""FastAPI 入口：上传 NodeList / Service / EndpointSliceList 快照，
+查看每个就绪节点上各 TCP 端口在 externalTrafficPolicy=Local 下的接流状态。
+"""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .models import parse_nodes, parse_pods
-from .planner import MAX_DRAIN_NODES, MAX_MIGRATING_PODS, Planner, _node_eligibility
+from .analyzer import analyze
+from .models import (
+    SnapshotError,
+    parse_endpoint_slices,
+    parse_nodes,
+    parse_service,
+)
 
-app = FastAPI(title="K8s 缩容落点试算器", version="1.0.0")
+app = FastAPI(title="LoadBalancer Local 接流核查器", version="1.0.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
+SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
+
+STATUS_LABELS = {
+    "accept": "可接流",
+    "terminating_only": "仅终止兜底",
+    "unavailable": "无可用后端",
+    "unconfirmed": "无法确认",
+}
 
 
 def _load_json_bytes(data: bytes, label: str) -> Any:
@@ -27,124 +42,97 @@ def _load_json_bytes(data: bytes, label: str) -> Any:
         raise HTTPException(status_code=400, detail=f"{label} 不是合法 JSON：{exc}") from exc
 
 
-def _build_overview(node_payload: Any, pod_payload: Any) -> dict:
-    try:
-        nodes = parse_nodes(node_payload)
-        pods = parse_pods(pod_payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    node_view = [
-        {
-            "name": n.name,
-            "ready": n.ready,
-            "unschedulable": n.unschedulable,
-            "taint_count": len(n.taints),
-            "eligible": not _node_eligibility(n),
-            "ineligible_reasons": _node_eligibility(n),
-            "cpu_alloc_m": n.cpu_alloc_m,
-            "mem_alloc_bytes": n.mem_alloc_bytes,
-        }
-        for n in sorted(nodes, key=lambda x: x.name)
-    ]
-    pod_view = [
-        {
-            "ref": p.ref,
-            "namespace": p.namespace,
-            "name": p.name,
-            "node": p.node,
-            "phase": p.phase,
-            "active": p.active,
-            "cpu_request_m": p.cpu_request_m,
-            "mem_request_bytes": p.mem_request_bytes,
-            "unsupported_reasons": p.unsupported_reasons,
-            "is_daemonset": p.is_daemonset,
-            "is_mirror": p.is_mirror,
-        }
-        for p in sorted(pods, key=lambda x: (x.node, x.namespace, x.name))
-    ]
-    return {
-        "nodes": node_view,
-        "pods": pod_view,
-        "limits": {
-            "max_drain_nodes": MAX_DRAIN_NODES,
-            "max_migrating_pods": MAX_MIGRATING_PODS,
-        },
-    }
-
-
-class PlanRequest(BaseModel):
+class AnalyzeRequest(BaseModel):
     node_list: Any
-    pod_list: Any
-    drained_nodes: list[str]
+    service: Any
+    endpoint_slice_list: Any
 
 
-@app.post("/api/overview")
-async def overview(
-    node_list: UploadFile | None = File(default=None),
-    pod_list: UploadFile | None = File(default=None),
-):
-    if node_list is None or pod_list is None:
-        raise HTTPException(status_code=400, detail="需要上传 node_list 与 pod_list 两个 JSON 文件")
-    node_payload = _load_json_bytes(await node_list.read(), "NodeList")
-    pod_payload = _load_json_bytes(await pod_list.read(), "PodList")
-    return _build_overview(node_payload, pod_payload)
-
-
-@app.post("/api/plan")
-async def plan(
-    node_list: UploadFile | None = File(default=None),
-    pod_list: UploadFile | None = File(default=None),
-    drained_nodes: str = Form(default="[]"),
-):
-    if node_list is None or pod_list is None:
-        raise HTTPException(status_code=400, detail="需要上传 node_list 与 pod_list 两个 JSON 文件")
-    node_payload = _load_json_bytes(await node_list.read(), "NodeList")
-    pod_payload = _load_json_bytes(await pod_list.read(), "PodList")
-    try:
-        drained = json.loads(drained_nodes)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"drained_nodes 不是合法 JSON 数组：{exc}") from exc
-    if not isinstance(drained, list) or not all(isinstance(x, str) for x in drained):
-        raise HTTPException(status_code=400, detail="drained_nodes 必须是字符串数组")
-
+def _run_analysis(node_payload: Any, service_payload: Any, slice_payload: Any) -> dict:
     try:
         nodes = parse_nodes(node_payload)
-        pods = parse_pods(pod_payload)
-    except ValueError as exc:
+        service = parse_service(service_payload)
+        raw_slices = parse_endpoint_slices(slice_payload)
+        result = analyze(nodes, service, raw_slices)
+    except SnapshotError as exc:
+        # 重查失败：返回 400，前端据此撤下旧结果并展示原因。
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    result = Planner(nodes, pods).plan(drained)
     return _serialize(result)
-
-
-@app.post("/api/plan-json")
-async def plan_json(req: PlanRequest):
-    """供脚本/curl 直接以 JSON 体调用的试算接口。"""
-    try:
-        nodes = parse_nodes(req.node_list)
-        pods = parse_pods(req.pod_list)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _serialize(Planner(nodes, pods).plan(req.drained_nodes))
 
 
 def _serialize(result) -> dict:
     return {
-        "feasible": result.feasible,
-        "drained_nodes": result.drained_nodes,
-        "excluded_pods": result.excluded_pods,
-        "migrating_pods": result.migrating_pods,
-        "candidates": result.candidates,
-        "placement": result.placement,
-        "node_remaining": result.node_remaining,
-        "violations": result.violations,
+        "namespace": result.namespace,
+        "service": result.service,
+        "external_traffic_policy": result.external_traffic_policy,
+        "matched_slices": result.matched_slices,
+        "ready_nodes": result.ready_nodes,
+        "skipped_nodes": result.skipped_nodes,
         "diagnostics": result.diagnostics,
-        "limits": {
-            "max_drain_nodes": MAX_DRAIN_NODES,
-            "max_migrating_pods": MAX_MIGRATING_PODS,
-        },
+        "status_labels": STATUS_LABELS,
+        "node_ports": [
+            {
+                "node": np.node,
+                "port_name": np.port_name,
+                "service_port": np.service_port,
+                "target_ports": np.target_ports,
+                "status": np.status,
+                "status_label": STATUS_LABELS[np.status],
+                "ready_backend_count": np.ready_backend_count,
+                "terminating_backend_count": np.terminating_backend_count,
+                "unavailable_backend_count": np.unavailable_backend_count,
+                "backends": np.backends,
+                "conflicts": np.conflicts,
+                "note": np.note,
+            }
+            for np in result.node_ports
+        ],
     }
+
+
+@app.post("/api/analyze")
+async def analyze_uploads(
+    node_list: UploadFile | None = File(default=None),
+    service: UploadFile | None = File(default=None),
+    endpoint_slice_list: UploadFile | None = File(default=None),
+):
+    if node_list is None or service is None or endpoint_slice_list is None:
+        raise HTTPException(
+            status_code=400,
+            detail="需要上传 node_list、service、endpoint_slice_list 三个 JSON 文件",
+        )
+    node_payload = _load_json_bytes(await node_list.read(), "NodeList")
+    service_payload = _load_json_bytes(await service.read(), "Service")
+    slice_payload = _load_json_bytes(await endpoint_slice_list.read(), "EndpointSliceList")
+    return _run_analysis(node_payload, service_payload, slice_payload)
+
+
+@app.post("/api/analyze-json")
+async def analyze_json(req: AnalyzeRequest):
+    """供脚本/curl 直接以 JSON 体调用。"""
+    return _run_analysis(req.node_list, req.service, req.endpoint_slice_list)
+
+
+@app.get("/api/samples")
+async def list_samples():
+    """列出内置示例快照，供网页一键加载演示。"""
+    scenarios: list[dict] = []
+    if not SAMPLES_DIR.is_dir():
+        return {"scenarios": scenarios}
+    for scenario_dir in sorted(p for p in SAMPLES_DIR.iterdir() if p.is_dir()):
+        files = {
+            "node_list": scenario_dir / "nodes.json",
+            "service": scenario_dir / "service.json",
+            "endpoint_slice_list": scenario_dir / "endpoint-slices.json",
+        }
+        if all(path.is_file() for path in files.values()):
+            scenarios.append({
+                "id": scenario_dir.name,
+                "name": scenario_dir.name,
+                "files": {key: f"/samples/{scenario_dir.name}/{path.name}"
+                          for key, path in files.items()},
+            })
+    return {"scenarios": scenarios}
 
 
 @app.get("/healthz")
@@ -158,3 +146,5 @@ async def index():
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# 内置示例只读挂载，供网页拉取演示数据。
+app.mount("/samples", StaticFiles(directory=SAMPLES_DIR), name="samples")

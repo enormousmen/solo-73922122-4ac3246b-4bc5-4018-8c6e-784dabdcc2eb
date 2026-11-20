@@ -1,262 +1,271 @@
-"""解析 NodeList / PodList 快照，提取试算所需的领域模型。
+"""解析 NodeList / Service / EndpointSliceList 快照，提取接流判定所需的领域模型。
 
-只依赖标准库，所有输入均视为不可信数据，解析阶段不做任何导入执行。
+只依赖标准库；所有输入均视为不可信数据，解析阶段不执行任何外部代码。
+本工具的判定范围：IPv4、externalTrafficPolicy=Local 的 LoadBalancer Service。
 """
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
-HOSTNAME_TOPOLOGY_KEY = "kubernetes.io/hostname"
-ENDED_PHASES = {"Succeeded", "Failed"}
+SERVICE_KIND = "Service"
+ENDPOINT_SLICE_KIND = "EndpointSlice"
+SERVICE_LABEL = "kubernetes.io/service-name"
+PROTOCOL_TCP = "TCP"
+PROTOCOL_UDP = "UDP"
 
 
-# --------------------------------------------------------------------------- #
-# 资源量解析
-# --------------------------------------------------------------------------- #
-def parse_cpu_millicores(value: Any) -> int:
-    """把 Kubernetes CPU 量解析为毫核（millicore）整数。"""
-    if value is None:
-        return 0
-    if isinstance(value, bool):  # bool 是 int 的子类，显式拒绝
-        raise ValueError(f"非法 CPU 量: {value!r}")
-    if isinstance(value, (int, float)):
-        return int(round(float(value) * 1000))
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return 0
-        if text.endswith("m"):
-            return int(round(float(text[:-1])))
-        return int(round(float(text) * 1000))
-    raise ValueError(f"非法 CPU 量: {value!r}")
+class SnapshotError(ValueError):
+    """快照结构或内容不满足判定前提时抛出。"""
 
 
-_MEMORY_SUFFIXES = {
-    "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3,
-    "Ti": 1024 ** 4, "Pi": 1024 ** 5, "Ei": 1024 ** 6,
-    "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9,
-    "T": 10 ** 12, "P": 10 ** 15, "E": 10 ** 18,
-}
-
-
-def parse_memory_bytes(value: Any) -> int:
-    """把 Kubernetes 内存量解析为字节整数。"""
-    if value is None:
-        return 0
-    if isinstance(value, bool):
-        raise ValueError(f"非法内存量: {value!r}")
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return 0
-        for suffix, factor in _MEMORY_SUFFIXES.items():
-            if text.endswith(suffix):
-                return int(round(float(text[: -len(suffix)]) * factor))
-        return int(float(text))
-    raise ValueError(f"非法内存量: {value!r}")
-
-
-def _items(payload: Any) -> list[dict]:
+def _items(payload: Any, label: str) -> list[dict]:
     if isinstance(payload, dict) and isinstance(payload.get("items"), list):
         return [x for x in payload["items"] if isinstance(x, dict)]
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
-    raise ValueError("快照既不是 Kubernetes List 对象（含 items），也不是数组")
+    raise SnapshotError(f"{label} 既不是 Kubernetes List 对象（含 items），也不是数组")
+
+
+def is_ipv4(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
-# 领域模型
+# Node
 # --------------------------------------------------------------------------- #
 @dataclass
 class NodeInfo:
     name: str
-    labels: dict[str, str]
-    taints: list[dict]
     ready: bool
-    unschedulable: bool
-    cpu_alloc_m: int
-    mem_alloc_bytes: int
-    ineligible_reasons: list[str] = field(default_factory=list)
-
-
-@dataclass
-class AntiSelector:
-    """硬反亲和中的一条 matchLabels 选择器（拓扑键已限定为 hostname）。"""
-    match_labels: dict[str, str]
-
-
-@dataclass
-class PodInfo:
-    namespace: str
-    name: str
-    node: str
-    phase: str
-    active: bool
-    labels: dict[str, str]
-    cpu_request_m: int
-    mem_request_bytes: int
-    node_selector: dict[str, str]
-    anti_selectors: list[AntiSelector]
-    unsupported_reasons: list[str] = field(default_factory=list)
-    container_count: int = 0
-    init_container_count: int = 0
-    volume_count: int = 0
-    is_daemonset: bool = False
-    is_mirror: bool = False
-
-    @property
-    def ref(self) -> str:
-        return f"{self.namespace}/{self.name}"
 
 
 def parse_nodes(payload: Any) -> list[NodeInfo]:
     nodes: list[NodeInfo] = []
-    for raw in _items(payload):
+    seen: set[str] = set()
+    for raw in _items(payload, "NodeList"):
         metadata = raw.get("metadata") or {}
-        spec = raw.get("spec") or {}
-        status = raw.get("status") or {}
-        name = metadata.get("name") or "<unknown>"
-        labels = {k: str(v) for k, v in (metadata.get("labels") or {}).items()}
-
-        taints = spec.get("taints") or []
-        unschedulable = bool(spec.get("unschedulable"))
-
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name:
+            raise SnapshotError("NodeList 中存在缺少 metadata.name 的节点")
+        if name in seen:
+            raise SnapshotError(f"NodeList 中节点 {name} 重复出现")
+        seen.add(name)
         ready = False
-        for cond in status.get("conditions") or []:
-            if cond.get("type") == "Ready":
+        for cond in (raw.get("status") or {}).get("conditions") or []:
+            if isinstance(cond, dict) and cond.get("type") == "Ready":
                 ready = cond.get("status") == "True"
-
-        allocatable = status.get("allocatable") or {}
-        reasons: list[str] = []
-        try:
-            cpu_alloc = parse_cpu_millicores(allocatable.get("cpu"))
-        except ValueError as exc:
-            cpu_alloc = 0
-            reasons.append(str(exc))
-        try:
-            mem_alloc = parse_memory_bytes(allocatable.get("memory"))
-        except ValueError as exc:
-            mem_alloc = 0
-            reasons.append(str(exc))
-        if "cpu" not in allocatable:
-            reasons.append("节点缺少 status.allocatable.cpu")
-        if "memory" not in allocatable:
-            reasons.append("节点缺少 status.allocatable.memory")
-
-        nodes.append(NodeInfo(
-            name=name,
-            labels=labels,
-            taints=list(taints),
-            ready=ready,
-            unschedulable=unschedulable,
-            cpu_alloc_m=cpu_alloc,
-            mem_alloc_bytes=mem_alloc,
-            ineligible_reasons=reasons,
-        ))
+        nodes.append(NodeInfo(name=name, ready=ready))
+    if not nodes:
+        raise SnapshotError("NodeList 中没有任何节点")
     return nodes
 
 
-def _extract_anti_selectors(affinity: dict) -> tuple[list[AntiSelector], list[str]]:
-    """提取 hostname 拓扑键的 matchLabels 硬反亲和，其余硬约束报为不支持。"""
-    selectors: list[AntiSelector] = []
-    unsupported: list[str] = []
+# --------------------------------------------------------------------------- #
+# Service
+# --------------------------------------------------------------------------- #
+@dataclass
+class ServicePort:
+    name: str
+    port: int
+    target_port: int | None  # 数字 targetPort 直接给出；字符串则需到切片里按端口名匹配
+    target_port_name: str | None
 
-    pod_affinity = affinity.get("podAffinity") or {}
-    if pod_affinity.get("requiredDuringSchedulingIgnoredDuringExecution"):
-        unsupported.append("含硬性 podAffinity（requiredDuringScheduling...），试算器不支持")
 
-    node_affinity = affinity.get("nodeAffinity") or {}
-    if node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution"):
-        unsupported.append("含硬性 nodeAffinity，试算器仅支持 nodeSelector")
+@dataclass
+class ServiceInfo:
+    namespace: str
+    name: str
+    traffic_policy: str
+    ports: list[ServicePort]
 
-    anti = affinity.get("podAntiAffinity") or {}
-    terms = anti.get("requiredDuringSchedulingIgnoredDuringExecution") or []
-    for term in terms:
-        topology_key = term.get("topologyKey")
-        if topology_key != HOSTNAME_TOPOLOGY_KEY:
-            unsupported.append(
-                f"硬反亲和拓扑键为 {topology_key!r}，仅支持 {HOSTNAME_TOPOLOGY_KEY}"
+
+def _as_port_number(value: Any) -> int:
+    if isinstance(value, bool):
+        raise SnapshotError(f"非法端口号: {value!r}")
+    if isinstance(value, int) and 0 < value <= 65535:
+        return value
+    raise SnapshotError(f"非法端口号: {value!r}")
+
+
+def parse_service(payload: Any) -> ServiceInfo:
+    if not isinstance(payload, dict):
+        raise SnapshotError("Service 快照必须是单个 Service 对象")
+    if isinstance(payload.get("items"), list):
+        raise SnapshotError("请上传单个 Service 对象，而不是 ServiceList")
+    kind = payload.get("kind")
+    if kind is not None and kind != SERVICE_KIND:
+        raise SnapshotError(f"Service 快照 kind={kind!r}，期望 Service")
+
+    metadata = payload.get("metadata") or {}
+    spec = payload.get("spec") or {}
+    namespace = metadata.get("namespace") or "default"
+    name = metadata.get("name")
+    if not isinstance(name, str) or not name:
+        raise SnapshotError("Service 缺少 metadata.name")
+
+    if spec.get("type") != "LoadBalancer":
+        raise SnapshotError(f"仅支持 type=LoadBalancer 的 Service，当前为 {spec.get('type')!r}")
+    policy = spec.get("externalTrafficPolicy")
+    if policy != "Local":
+        raise SnapshotError(
+            f"仅支持 externalTrafficPolicy=Local，当前为 {policy!r}"
+        )
+
+    raw_ports = spec.get("ports")
+    if not isinstance(raw_ports, list) or not raw_ports:
+        raise SnapshotError("Service 没有声明任何 spec.ports")
+
+    ports: list[ServicePort] = []
+    seen_names: set[str] = set()
+    for raw_port in raw_ports:
+        if not isinstance(raw_port, dict):
+            raise SnapshotError("Service spec.ports 中存在非对象条目")
+        protocol = str(raw_port.get("protocol", PROTOCOL_TCP)).upper()
+        if protocol != PROTOCOL_TCP:
+            # 本工具只看 TCP 端口；UDP/SCTP 直接跳过。
+            continue
+        port_name = raw_port.get("name")
+        if not isinstance(port_name, str) or not port_name:
+            raise SnapshotError(
+                f"Service 端口 {raw_port.get('port')!r} 缺少 name；Local 策略按端口名关联切片，端口必须命名"
             )
-            continue
-        selector = term.get("labelSelector") or {}
-        if selector.get("matchExpressions"):
-            unsupported.append("硬反亲和 labelSelector 含 matchExpressions，仅支持 matchLabels")
-            continue
-        match_labels = selector.get("matchLabels") or {}
-        if match_labels:
-            selectors.append(AntiSelector({k: str(v) for k, v in match_labels.items()}))
-    # preferredDuringScheduling* 属于软约束，不影响硬性可调度性，忽略。
-    return selectors, unsupported
+        if port_name in seen_names:
+            raise SnapshotError(f"Service 存在同名 TCP 端口 {port_name!r}")
+        seen_names.add(port_name)
+        port_no = _as_port_number(raw_port.get("port"))
 
-
-def parse_pods(payload: Any) -> list[PodInfo]:
-    pods: list[PodInfo] = []
-    for raw in _items(payload):
-        metadata = raw.get("metadata") or {}
-        spec = raw.get("spec") or {}
-        status = raw.get("status") or {}
-
-        namespace = metadata.get("namespace") or "default"
-        name = metadata.get("name") or "<unknown>"
-        labels = {k: str(v) for k, v in (metadata.get("labels") or {}).items()}
-        phase = status.get("phase") or "Pending"
-        active = phase not in ENDED_PHASES
-
-        containers = spec.get("containers") or []
-        init_containers = spec.get("initContainers") or []
-        volumes = spec.get("volumes") or []
-        node_selector = {k: str(v) for k, v in (spec.get("nodeSelector") or {}).items()}
-
-        unsupported: list[str] = []
-        if len(containers) != 1:
-            unsupported.append(f"容器数为 {len(containers)}，仅支持单容器 Pod")
-        if init_containers:
-            unsupported.append(f"含 {len(init_containers)} 个 init 容器，仅支持无初始化容器的 Pod")
-        if volumes:
-            unsupported.append(f"含 {len(volumes)} 个卷，仅支持无卷 Pod")
-
-        anti_selectors: list[AntiSelector] = []
-        affinity = spec.get("affinity")
-        if isinstance(affinity, dict):
-            anti_selectors, affinity_reasons = _extract_anti_selectors(affinity)
-            unsupported.extend(affinity_reasons)
-
-        cpu_req = mem_req = 0
-        if len(containers) == 1:
-            requests = (containers[0].get("resources") or {}).get("requests") or {}
-            try:
-                cpu_req = parse_cpu_millicores(requests.get("cpu"))
-            except ValueError as exc:
-                unsupported.append(str(exc))
-            try:
-                mem_req = parse_memory_bytes(requests.get("memory"))
-            except ValueError as exc:
-                unsupported.append(str(exc))
-
-        owner_refs = metadata.get("ownerReferences") or []
-        is_daemonset = any(o.get("kind") == "DaemonSet" for o in owner_refs)
-        annotations = metadata.get("annotations") or {}
-        is_mirror = "kubernetes.io/config.mirror" in annotations
-
-        pods.append(PodInfo(
-            namespace=namespace,
-            name=name,
-            node=spec.get("nodeName") or "",
-            phase=phase,
-            active=active,
-            labels=labels,
-            cpu_request_m=cpu_req,
-            mem_request_bytes=mem_req,
-            node_selector=node_selector,
-            anti_selectors=anti_selectors,
-            unsupported_reasons=unsupported,
-            container_count=len(containers),
-            init_container_count=len(init_containers),
-            volume_count=len(volumes),
-            is_daemonset=is_daemonset,
-            is_mirror=is_mirror,
+        target = raw_port.get("targetPort", port_no)
+        target_port = target_port_name = None
+        if isinstance(target, bool):
+            raise SnapshotError(f"端口 {port_name} 的 targetPort 非法: {target!r}")
+        if isinstance(target, int):
+            target_port = _as_port_number(target)
+        elif isinstance(target, str) and target:
+            if target.isdigit():
+                target_port = _as_port_number(int(target))
+            else:
+                target_port_name = target
+        else:
+            raise SnapshotError(f"端口 {port_name} 的 targetPort 非法: {target!r}")
+        ports.append(ServicePort(
+            name=port_name,
+            port=port_no,
+            target_port=target_port,
+            target_port_name=target_port_name,
         ))
-    return pods
+
+    if not ports:
+        raise SnapshotError("Service 没有任何 TCP 端口，无法判定接流状态")
+    return ServiceInfo(
+        namespace=namespace,
+        name=name,
+        traffic_policy=policy,
+        ports=ports,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# EndpointSlice
+# --------------------------------------------------------------------------- #
+@dataclass
+class SlicePort:
+    name: str | None
+    port: int
+    protocol: str
+
+
+@dataclass
+class EndpointRecord:
+    """一条后端记录：某个 IPv4 地址（后端 IP）+ 切片端口（目标端口）。"""
+    slice_name: str
+    address: str
+    target_port: int
+    port_name: str | None
+    node: str | None
+    ready: bool
+    serving: bool
+    terminating: bool
+
+
+@dataclass
+class EndpointSliceData:
+    slices: list[dict] = field(default_factory=list)
+
+
+def parse_endpoint_slices(payload: Any) -> list[dict]:
+    slices = _items(payload, "EndpointSliceList")
+    if not slices:
+        raise SnapshotError("EndpointSliceList 中没有任何切片")
+    names: set[str] = set()
+    for raw in slices:
+        kind = raw.get("kind")
+        if kind is not None and kind != ENDPOINT_SLICE_KIND:
+            raise SnapshotError(f"切片 {raw.get('metadata', {}).get('name')!r} kind={kind!r}，期望 EndpointSlice")
+        name = (raw.get("metadata") or {}).get("name") or "<unknown>"
+        if name in names:
+            raise SnapshotError(f"EndpointSliceList 中切片 {name} 重复出现")
+        names.add(name)
+    return slices
+
+
+def _endpoint_flag(endpoint: dict, key: str) -> bool:
+    """EndpointSlice 条件三态：true/false；缺省（None）按 false 处理。"""
+    value = (endpoint.get("conditions") or {}).get(key)
+    return value is True
+
+
+def iter_slice_records(raw_slices: list[dict]) -> list[EndpointRecord]:
+    """把切片展开成 (IPv4 后端 IP, 切片端口) 粒度的记录，非 TCP / 非 IPv4 已剔除。"""
+    records: list[EndpointRecord] = []
+    for raw in raw_slices:
+        metadata = raw.get("metadata") or {}
+        slice_name = metadata.get("name") or "<unknown>"
+        slice_ports: list[SlicePort] = []
+        for sp in raw.get("ports") or []:
+            if not isinstance(sp, dict):
+                continue
+            protocol = str(sp.get("protocol", PROTOCOL_TCP)).upper()
+            if protocol != PROTOCOL_TCP:
+                continue
+            port_no = sp.get("port")
+            if not isinstance(port_no, int) or isinstance(port_no, bool) or not (0 < port_no <= 65535):
+                # 目标端口缺失/非法时无法定位后端，跳过该切片端口。
+                continue
+            slice_ports.append(SlicePort(
+                name=sp.get("name") if isinstance(sp.get("name"), str) else None,
+                port=port_no,
+                protocol=protocol,
+            ))
+
+        for endpoint in raw.get("endpoints") or []:
+            if not isinstance(endpoint, dict):
+                continue
+            node = endpoint.get("nodeName")
+            node = node if isinstance(node, str) else None
+            addresses = [a for a in (endpoint.get("addresses") or []) if is_ipv4(a)]
+            if not addresses:
+                # 限 IPv4：无 IPv4 地址的端点（IPv6/FQDN）不参与判定。
+                continue
+            ready = _endpoint_flag(endpoint, "ready")
+            serving = _endpoint_flag(endpoint, "serving")
+            terminating = _endpoint_flag(endpoint, "terminating")
+            for address in addresses:
+                for sp in slice_ports:
+                    records.append(EndpointRecord(
+                        slice_name=slice_name,
+                        address=address,
+                        target_port=sp.port,
+                        port_name=sp.name,
+                        node=node,
+                        ready=ready,
+                        serving=serving,
+                        terminating=terminating,
+                    ))
+    return records

@@ -1,229 +1,184 @@
-#!/usr/bin/env python3
-"""生成试算器的示例 NodeList / PodList 快照（仅用标准库）。
+"""生成接流核查器的演示快照。
 
-场景：
-  feasible/            可迁移：资源 + nodeSelector + hostname 双向反亲和均满足
-  infeasible-resource/ 不可迁移：承接节点总资源放不下全部待迁 Pod
-  infeasible-anti/     不可迁移：双向硬反亲和导致无完整方案
-  unsupported/         不支持的约束：多容器、卷、init 容器、污点节点
+用法：python3 scripts/generate_samples.py [输出目录，默认 samples]
+
+四个场景均为同一批 NodeList（含一个 NotReady 节点）+ 同一个
+LoadBalancer / externalTrafficPolicy=Local Service（http、metrics 两个 TCP 端口），
+差别只在 EndpointSliceList：
+
+  accept/                 就绪节点上有 ready 后端；另一个节点仅终止兜底/无后端
+  terminating-only/       全部就绪节点都没有 ready，只有 serving+terminating 后端
+  unavailable/            某节点两个端口都没有可用后端
+  conflict/               同一后端（IP+目标端口）在两份切片里条件冲突，且会改变结论；
+                          另有端口名解析出不同目标端口的冲突
 """
 from __future__ import annotations
 
-import argparse
 import json
+import sys
 from pathlib import Path
 
+SERVICE_NAME = "web-lb"
+NAMESPACE = "shop"
+NODE_NAMES = ["node-a", "node-b", "node-c"]  # node-c 为 NotReady
 
-def node(name, cpu, mem_mi, labels=None, taints=None, ready=True,
-         unschedulable=False):
-    conditions = [{"type": "Ready", "status": "True" if ready else "False",
-                   "reason": "KubeletReady"}]
+
+def node_list() -> dict:
     return {
-        "apiVersion": "v1", "kind": "Node",
-        "metadata": {"name": name, "labels": {"kubernetes.io/hostname": name,
-                                              **(labels or {})}},
-        "spec": {
-            "taints": taints or [],
-            "unschedulable": unschedulable,
-        },
-        "status": {
-            "conditions": conditions,
-            "allocatable": {"cpu": cpu, "memory": f"{mem_mi}Mi"},
-        },
-    }
-
-
-def pod(namespace, name, node_name, cpu_m, mem_mi, labels=None,
-        node_selector=None, anti_labels=None, containers=1,
-        init_containers=0, volumes=0, phase="Running", owner=None,
-        mirror=False):
-    labels = labels or {}
-    spec: dict = {
-        "nodeName": node_name,
-        "containers": [
-            {"name": f"{name}-c{i}",
-             "resources": {"requests": {"cpu": f"{cpu_m}m",
-                                        "memory": f"{mem_mi}Mi"}}}
-            for i in range(containers)
+        "apiVersion": "v1",
+        "kind": "NodeList",
+        "items": [
+            {
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": name},
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "True" if name != "node-c" else "False"}
+                    ]
+                },
+            }
+            for name in NODE_NAMES
         ],
     }
-    if node_selector:
-        spec["nodeSelector"] = node_selector
-    if init_containers:
-        spec["initContainers"] = [
-            {"name": f"{name}-init{i}", "image": "busybox"}
-            for i in range(init_containers)
-        ]
-    if volumes:
-        spec["volumes"] = [{"name": f"vol{i}", "emptyDir": {}}
-                           for i in range(volumes)]
-    if anti_labels:
-        spec["affinity"] = {
-            "podAntiAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": [
-                    {"topologyKey": "kubernetes.io/hostname",
-                     "labelSelector": {"matchLabels": anti_labels}}
-                ]
-            }
-        }
-    metadata: dict = {"name": name, "namespace": namespace, "labels": labels}
-    if owner:
-        kind = owner[0]
-        metadata["ownerReferences"] = [
-            {"apiVersion": "apps/v1", "kind": kind, "name": owner[1],
-             "uid": f"{name}-owner"}
-        ]
-    if mirror:
-        metadata["annotations"] = {"kubernetes.io/config.mirror": "abc123"}
+
+
+def service() -> dict:
     return {
-        "apiVersion": "v1", "kind": "Pod",
-        "metadata": metadata, "spec": spec,
-        "status": {"phase": phase},
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": SERVICE_NAME, "namespace": NAMESPACE},
+        "spec": {
+            "type": "LoadBalancer",
+            "externalTrafficPolicy": "Local",
+            "ports": [
+                {"name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP"},
+                {"name": "metrics", "port": 9100, "targetPort": "metrics-port", "protocol": "TCP"},
+            ],
+        },
     }
 
 
-def node_list(items):
-    return {"apiVersion": "v1", "kind": "NodeList", "items": items}
+def slice_(name: str, ports: list[dict], endpoints: list[dict]) -> dict:
+    return {
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {"kubernetes.io/service-name": SERVICE_NAME},
+        },
+        "addressType": "IPv4",
+        "ports": ports,
+        "endpoints": endpoints,
+    }
 
 
-def pod_list(items):
-    return {"apiVersion": "v1", "kind": "PodList", "items": items}
+def endpoint(ip: str, node: str, *, ready=None, serving=None, terminating=None) -> dict:
+    conditions = {}
+    if ready is not None:
+        conditions["ready"] = ready
+    if serving is not None:
+        conditions["serving"] = serving
+    if terminating is not None:
+        conditions["terminating"] = terminating
+    return {
+        "addresses": [ip],
+        "nodeName": node,
+        "conditions": conditions,
+    }
 
 
-# --------------------------------------------------------------------------- #
-# 场景 1：可迁移
-# --------------------------------------------------------------------------- #
-def feasible():
-    nodes = node_list([
-        node("node-a", "4", 4096, {"workload": "app", "zone": "z1"}),
-        node("node-b", "4", 4096, {"workload": "app", "zone": "z1"}),
-        node("node-c", "4", 4096, {"workload": "app", "zone": "z2"}),
-        node("node-d", "4", 4096, {"workload": "batch", "zone": "z2"}),
-        node("node-e", "4", 4096, {"workload": "app", "zone": "z3"}),
-    ])
-    pods = pod_list([
-        # 承接节点上的常驻 Pod（占用资源，参与反亲和）
-        pod("team1", "redis-0", "node-c", 1000, 1024, {"app": "redis"}),
-        pod("team1", "queue-0", "node-d", 500, 512, {"app": "queue"}),
-        pod("team1", "metrics-0", "node-e", 500, 512, {"app": "metrics"}),
-        # 已结束 Pod：不占资源
-        pod("team1", "job-done", "node-c", 2000, 2048, phase="Succeeded"),
-        # node-a / node-b 上待迁的 5 个 Pod
-        pod("team1", "web-1", "node-a", 500, 512,
-            labels={"app": "web", "tier": "frontend"},
-            anti_labels={"app": "web"}),
-        pod("team1", "web-2", "node-a", 500, 512,
-            labels={"app": "web", "tier": "frontend"},
-            anti_labels={"app": "web"}),
-        pod("team1", "worker-1", "node-a", 1000, 1024,
-            labels={"app": "worker"},
-            node_selector={"workload": "app"}),
-        pod("team1", "cache-1", "node-b", 500, 512,
-            labels={"app": "cache"}),
-        # DaemonSet Pod：drain 不迁移，应出现在 excluded_pods
-        pod("kube-system", "fluentd-node-a", "node-a", 100, 64,
-            labels={"app": "fluentd"}, owner=("DaemonSet", "fluentd")),
-    ])
-    return nodes, pods, ["node-a", "node-b"]
+HTTP_PORTS = [{"name": "http", "port": 8080, "protocol": "TCP"}]
+METRICS_PORTS = [{"name": "metrics-port", "port": 9101, "protocol": "TCP"}]
 
 
-# --------------------------------------------------------------------------- #
-# 场景 2：资源放不下（总量超配 + 单节点都放不下的大 Pod）
-# --------------------------------------------------------------------------- #
-def infeasible_resource():
-    nodes = node_list([
-        node("drain-1", "4", 4096, {"workload": "app"}),
-        node("drain-2", "4", 4096, {"workload": "app"}),
-        node("drain-3", "4", 4096, {"workload": "app"}),
-        node("node-c", "4", 4096, {"workload": "app"}),
-        node("node-d", "4", 4096, {"workload": "app"}),
-    ])
-    pods = pod_list([
-        # 承接节点已占用 3.5C/3.5Gi，每个仅剩 500m/512Mi
-        pod("team1", "resident-c", "node-c", 3500, 3584, {"app": "resident"}),
-        pod("team1", "resident-d", "node-d", 3500, 3584, {"app": "resident"}),
-        pod("team1", "big-1", "drain-1", 2000, 2048, {"app": "big"}),
-        pod("team1", "small-1", "drain-2", 500, 512, {"app": "small"}),
-        pod("team1", "small-2", "drain-3", 500, 512, {"app": "small"}),
-    ])
-    return nodes, pods, ["drain-1", "drain-2", "drain-3"]
+def build_accept() -> dict:
+    # node-a：http 有 ready；node-b：http 仅终止兜底；metrics node-a ready、node-b 无后端
+    return {"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList", "items": [
+        slice_("web-lb-http-1", HTTP_PORTS, [
+            endpoint("10.0.1.11", "node-a", ready=True, serving=True, terminating=False),
+            endpoint("10.0.1.12", "node-a", ready=True, serving=True, terminating=False),
+            endpoint("10.0.2.11", "node-b", ready=False, serving=True, terminating=True),
+        ]),
+        slice_("web-lb-metrics-1", METRICS_PORTS, [
+            endpoint("10.0.1.11", "node-a", ready=True, serving=True, terminating=False),
+        ]),
+    ]}
 
 
-# --------------------------------------------------------------------------- #
-# 场景 3：双向硬反亲和无解
-# --------------------------------------------------------------------------- #
-def infeasible_anti():
-    nodes = node_list([
-        node("drain-1", "4", 4096, {"workload": "app"}),
-        node("drain-2", "4", 4096, {"workload": "app"}),
-        node("node-c", "4", 4096, {"workload": "app"}),
-        node("node-d", "4", 4096, {"workload": "app"}),
-        # node-e 不 Ready：不能作为承接节点
-        node("node-e", "4", 4096, {"workload": "app"}, ready=False),
-    ])
-    pods = pod_list([
-        # node-c 上已有一个 web：web-1 / web-2 都不能去 node-c
-        pod("team1", "web-0", "node-c", 200, 256,
-            labels={"app": "web"}, anti_labels={"app": "web"}),
-        # 两个待迁 web 互相反亲和，且都不能去 node-c；只剩 node-d 一个节点 => 无解
-        pod("team1", "web-1", "drain-1", 300, 256,
-            labels={"app": "web"}, anti_labels={"app": "web"}),
-        pod("team1", "web-2", "drain-2", 300, 256,
-            labels={"app": "web"}, anti_labels={"app": "web"}),
-    ])
-    return nodes, pods, ["drain-1", "drain-2"]
+def build_terminating_only() -> dict:
+    # 两个就绪节点的两个端口都只有 serving+terminating 后端
+    return {"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList", "items": [
+        slice_("web-lb-http-term", HTTP_PORTS, [
+            endpoint("10.0.1.21", "node-a", ready=False, serving=True, terminating=True),
+            endpoint("10.0.2.21", "node-b", ready=False, serving=True, terminating=True),
+        ]),
+        slice_("web-lb-metrics-term", METRICS_PORTS, [
+            endpoint("10.0.1.21", "node-a", ready=False, serving=True, terminating=True),
+            endpoint("10.0.2.21", "node-b", ready=False, serving=True, terminating=True),
+        ]),
+    ]}
 
 
-# --------------------------------------------------------------------------- #
-# 场景 4：不支持的约束 / 结构
-# --------------------------------------------------------------------------- #
-def unsupported():
-    nodes = node_list([
-        node("drain-1", "4", 4096, {"workload": "app"}),
-        node("drain-tainted", "4", 4096,
-             taints=[{"key": "dedicated", "value": "gpu", "effect": "NoSchedule"}]),
-        node("node-c", "4", 4096, {"workload": "app"}),
-    ])
-    pods = pod_list([
-        # 多容器 + 卷：结构不支持
-        pod("team1", "legacy-app", "drain-1", 200, 256,
-            labels={"app": "legacy"}, containers=2, volumes=1),
-        # 带 init 容器：结构不支持
-        pod("team1", "init-app", "drain-1", 200, 256,
-            labels={"app": "initapp"}, init_containers=1),
-        # 普通 Pod：本身合规，但勾选了污点节点时整次请求会被拒绝
-        pod("team1", "plain-app", "drain-tainted", 200, 256,
-            labels={"app": "plain"}),
-    ])
-    return nodes, pods, ["drain-1"]
+def build_unavailable() -> dict:
+    # node-a：http ready 可接流；node-b：两个端口都无可用后端（端点 ready=False 且未在 serving）
+    return {"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList", "items": [
+        slice_("web-lb-http-down", HTTP_PORTS, [
+            endpoint("10.0.1.31", "node-a", ready=True, serving=True, terminating=False),
+            endpoint("10.0.2.31", "node-b", ready=False, serving=False, terminating=False),
+        ]),
+        slice_("web-lb-metrics-down", METRICS_PORTS, [
+            endpoint("10.0.1.31", "node-a", ready=True, serving=True, terminating=False),
+            endpoint("10.0.2.31", "node-b", ready=False, serving=False, terminating=True),
+        ]),
+    ]}
+
+
+def build_conflict() -> dict:
+    # 冲突 1：同一后端 10.0.1.41:8080 在两份切片里条件不一致
+    #   （一份 ready=True，一份 ready=False/serving=True/terminating=True），
+    #   采用不同记录会让 node-a/http 在「可接流」与「仅终止兜底」间摇摆 → 无法确认。
+    # 冲突 2：字符串 targetPort 端口名 metrics-port 在两份切片里分别解析为
+    #   9101 / 9102，且 node-b 仅在 9102 上有 ready 后端 → 无法确认。
+    return {"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList", "items": [
+        slice_("web-lb-http-a", HTTP_PORTS, [
+            endpoint("10.0.1.41", "node-a", ready=True, serving=True, terminating=False),
+            endpoint("10.0.2.41", "node-b", ready=True, serving=True, terminating=False),
+        ]),
+        slice_("web-lb-http-b", HTTP_PORTS, [
+            endpoint("10.0.1.41", "node-a", ready=False, serving=True, terminating=True),
+        ]),
+        slice_("web-lb-metrics-a", [{"name": "metrics-port", "port": 9101, "protocol": "TCP"}], [
+            endpoint("10.0.1.41", "node-a", ready=True, serving=True, terminating=False),
+        ]),
+        slice_("web-lb-metrics-b", [{"name": "metrics-port", "port": 9102, "protocol": "TCP"}], [
+            endpoint("10.0.2.41", "node-b", ready=True, serving=True, terminating=False),
+        ]),
+    ]}
 
 
 SCENARIOS = {
-    "feasible": (feasible, "可迁移：完整方案可求"),
-    "infeasible-resource": (infeasible_resource, "不可迁移：资源超配"),
-    "infeasible-anti": (infeasible_anti, "不可迁移：反亲和无解"),
-    "unsupported": (unsupported, "不支持：多容器/卷/init/污点"),
+    "accept": build_accept,
+    "terminating-only": build_terminating_only,
+    "unavailable": build_unavailable,
+    "conflict": build_conflict,
 }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="生成试算器示例快照")
-    parser.add_argument("out_dir", type=Path, help="输出根目录")
-    args = parser.parse_args()
-
-    for scenario, (builder, _desc) in SCENARIOS.items():
-        nodes, pods, drains = builder()
-        out = args.out_dir / scenario
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "nodes.json").write_text(
-            json.dumps(nodes, indent=2, ensure_ascii=False), encoding="utf-8")
-        (out / "pods.json").write_text(
-            json.dumps(pods, indent=2, ensure_ascii=False), encoding="utf-8")
-        (out / "drained-nodes.json").write_text(
-            json.dumps(drains, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"generated {scenario}: {len(nodes['items'])} nodes, "
-              f"{len(pods['items'])} pods, drains={drains}")
+def main(out_dir: str) -> None:
+    root = Path(out_dir)
+    for scenario, builder in SCENARIOS.items():
+        path = root / scenario
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "nodes.json").write_text(
+            json.dumps(node_list(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (path / "service.json").write_text(
+            json.dumps(service(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (path / "endpoint-slices.json").write_text(
+            json.dumps(builder(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else "samples")

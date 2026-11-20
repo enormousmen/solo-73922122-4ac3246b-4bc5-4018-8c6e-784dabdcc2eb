@@ -1,34 +1,43 @@
-# Kubernetes 缩容落点试算器
+# LoadBalancer Local 接流核查器
 
-值班员在缩容前上传同一批 **NodeList / PodList JSON 快照**，在网页勾选要下线的节点，
-系统在其余就绪可调度的节点上为全部待迁 Pod 寻找**同时成立**的落点方案，
-并给出逐 Pod 落点与各承接节点余量。无完整方案或遇到不支持的约束时，
-明确给出原因并由前端撤下旧方案（不展示任何残留落点）。
+负载均衡器把请求发到某个节点却偶尔断流时，值班员可在网页上传同一批
+**NodeList、单个 Service 和 EndpointSliceList 的 JSON 快照**，
+查看每个**就绪节点**上各 **TCP 端口**在 `externalTrafficPolicy=Local` 下的接流状态。
 
-## 试算规则
+## 判定范围与口径
 
 | 主题 | 规则 |
 | --- | --- |
-| 规模上限 | 单次最多勾选 **6** 个下线节点、最多 **8** 个待迁 Pod |
-| 节点资格 | 下线节点与承接节点都必须：无污点、`Ready=True`、未被 cordon、`allocatable` 完整 |
-| Pod 结构 | 仅支持**单容器、无 init 容器、无卷**的 Pod；否则报“不支持的约束”并拒绝整次试算 |
-| 资源口径 | 从节点 `status.allocatable` 中扣除**仍在该节点且尚未结束**（phase 非 Succeeded/Failed）的 Pod 的 CPU/内存 **requests**；待迁 Pod 不计入原节点占用 |
-| 调度约束 | 支持 `nodeSelector`；硬 `nodeAffinity`、硬 `podAffinity` 报不支持 |
-| 反亲和 | 仅支持同命名空间内、拓扑键为 `kubernetes.io/hostname`、`labelSelector.matchLabels` 的**硬** `podAntiAffinity`；**双向检查**（A 的选择器命中 B 或 B 的选择器命中 A 都算冲突）；其他拓扑键、`matchExpressions` 报不支持；软约束（preferred）忽略 |
-| 完整性 | 所有待迁 Pod 必须在同一份方案中同时放下，采用 MRV + 回溯求解；找不到即判定无完整方案 |
-| DaemonSet/静态 Pod | drain 本就不迁移这类 Pod，自动列入 `excluded_pods` 并说明原因 |
+| 服务前提 | 仅支持 `type=LoadBalancer` 且 `externalTrafficPolicy=Local` 的 Service；否则整次核查报错 |
+| 协议/地址 | 仅看 TCP 端口与 IPv4 后端地址；UDP/SCTP 端口、IPv6/FQDN 端点忽略 |
+| 切片关联 | 按**命名空间** + 标签 `kubernetes.io/service-name=<服务名>` 关联 EndpointSlice，再按端口名/目标端口匹配 |
+| 节点范围 | 只评估 `Ready=True` 的节点；未就绪节点列出为跳过项，其后端不参与判定 |
+| 后端身份 | 同一端口下，**后端 IP + 目标端口**相同的切片记录视为同一后端（多条记录合并） |
+| 可接流 `accept` | 该节点该端口存在 `conditions.ready=true` 的后端 |
+| 仅终止兜底 `terminating_only` | 没有 ready 后端，但存在 `serving=true` 且 `terminating=true` 的后端 |
+| 无可用后端 `unavailable` | 上述两类后端都没有 |
+| 无法确认 `unconfirmed` | 不同切片记录对同一后端说法不一，且采用不同记录会改变本节点端口的结论；响应中列出冲突的 IP 与目标端口（及切片名、条件差异） |
+
+Local 策略下只看**本节点**的后端：别的节点上有 ready 后端不能帮本节点接流。
+端点条件缺省（字段未出现）按 `false` 处理。
+
+### 端口匹配细节
+
+- Service 端口为**数字 `targetPort`**：按目标端口号匹配切片端口，与切片端口名无关。
+- Service 端口为**字符串 `targetPort`**：按切片端口的 `name` 匹配；若同名端口在不同切片里
+  解析出不同端口号，记为 `target_port_conflict`，当因此导致节点端口结论不一致时标 `unconfirmed`。
 
 ## 目录结构
 
 ```
 app/
-  models.py           # 快照解析、CPU/内存量解析、领域模型、约束识别
-  planner.py          # 候选筛选、资源核算、双向反亲和、回溯求完整方案
-  main.py             # FastAPI 路由（multipart 与 JSON 两种调用方式）
-  static/index.html   # 单页前端（上传 → 勾选 → 试算 → 撤旧方案）
-samples/              # 4 组可直接试算的快照（由脚本生成）
+  models.py           # 快照解析与领域模型（Node / Service / EndpointSlice 记录）
+  analyzer.py         # 切片关联、后端合并、三种结论与冲突判定
+  main.py             # FastAPI 路由（multipart 与 JSON 两种调用方式 + 示例清单）
+  static/index.html   # 单页前端（上传 → 核查 → 撤旧结果）
+samples/              # 4 组可直接演示的快照（由脚本生成）
 scripts/generate_samples.py
-tests/test_planner.py # 20 个自测用例
+tests/test_analyzer.py # 34 个自测用例
 Dockerfile / docker-compose.yml
 ```
 
@@ -39,8 +48,7 @@ docker compose up --build
 # 打开 http://localhost:8000
 ```
 
-`./samples` 以只读方式挂载到容器内 `/data/samples`，可直接在网页上传其中的
-`nodes.json` / `pods.json`。
+网页支持上传三个 JSON 文件，也可在下拉框中**一键加载内置示例**并核查。
 
 ## 本地直接运行（无 Docker 时）
 
@@ -52,19 +60,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## HTTP 接口
 
-- `POST /api/overview`（multipart：`node_list`、`pod_list`）：返回节点资格与 Pod 概览
-- `POST /api/plan`（multipart：两个快照 + 字符串字段 `drained_nodes`，值为 JSON 数组）
-- `POST /api/plan-json`（JSON 体：`{node_list, pod_list, drained_nodes}`），适合脚本
+- `POST /api/analyze`（multipart：`node_list`、`service`、`endpoint_slice_list`）
+- `POST /api/analyze-json`（JSON 体：`{node_list, service, endpoint_slice_list}`），适合脚本
+- `GET /api/samples`：内置示例清单（网页演示用）
 - `GET /healthz`
 
-curl 示例（注意 `drained_nodes` 用 `<` 作为普通表单字符串传入）：
+curl 示例：
 
 ```bash
 curl -s \
-  -F "node_list=@samples/feasible/nodes.json" \
-  -F "pod_list=@samples/feasible/pods.json" \
-  -F "drained_nodes=<samples/feasible/drained-nodes.json" \
-  http://localhost:8000/api/plan
+  -F "node_list=@samples/conflict/nodes.json" \
+  -F "service=@samples/conflict/service.json" \
+  -F "endpoint_slice_list=@samples/conflict/endpoint-slices.json" \
+  http://localhost:8000/api/analyze
 ```
 
 ## 示例快照
@@ -73,10 +81,10 @@ curl -s \
 
 | 场景 | 目录 | 预期结果 |
 | --- | --- | --- |
-| 可迁移 | `samples/feasible/` | 4 个待迁 Pod 全部落地；两个 `app=web` Pod 因硬反亲和分到不同节点；`worker-1` 受 nodeSelector 限制不去 batch 节点；DaemonSet Pod 列入排除项；Succeeded Pod 不占资源 |
-| 资源超配 | `samples/infeasible-resource/` | 大 Pod 在两个承接节点上 CPU/内存均不足，无完整方案并给出逐节点缺口 |
-| 反亲和无解 | `samples/infeasible-anti/` | 两个互相反亲和的 web Pod 只剩一个合格承接节点（另一节点已有 web、第三个节点不 Ready），回溯失败 |
-| 不支持约束 | `samples/unsupported/` | 多容器+卷、init 容器 Pod 被拒绝；勾选污点节点同样被拒绝 |
+| 正常接流 | `samples/accept/` | node-a 两个端口均有 ready 后端可接流；node-b 的 http 仅终止兜底、metrics 无可用后端；node-c 未就绪被跳过 |
+| 仅终止兜底 | `samples/terminating-only/` | 两个就绪节点的两个端口都只有 serving+terminating 后端 |
+| 无可用后端 | `samples/unavailable/` | node-b 两个端口的后端均不可用；node-a 正常可接流 |
+| 记录冲突 | `samples/conflict/` | node-a/http 同一后端 `10.0.1.41:8080` 在两份切片中条件冲突 → 无法确认；metrics 端口名解析出 9101/9102 两个目标端口 → 无法确认，并列出冲突 IP/端口 |
 
 ## 自测
 
@@ -87,8 +95,8 @@ python -m pytest tests/ -v
 
 ## 已知边界（未实现/刻意不支持）
 
-- 不支持硬 `nodeAffinity`、硬 `podAffinity`、非 hostname 拓扑键与 `matchExpressions`；遇到即报错并撤下方案
-- 不处理 PVC/存储卷、init 容器、多容器（sidecar）Pod
-- 软亲和/反亲和（`preferredDuringScheduling*`）不参与硬性可调度性判断，直接忽略
-- 不模拟真实调度器的 taints/tolerations 联动、端口占用、设备插件等；无污点节点之外的节点不参与
-- 只做静态 requests 核算，不考虑超售比例与实时指标
+- 仅支持 IPv4；IPv6 地址与 FQDN 端点不参与判定
+- 仅评估 TCP 端口，UDP/SCTP 直接忽略
+- 不支持非 LoadBalancer 或 `externalTrafficPolicy=Cluster` 的 Service，遇到即报错并由前端撤下旧结果
+- 不模拟 kube-proxy 的实际转发行为、健康检查节点门控（`healthcheckNodePort`）与防火墙规则，只按 EndpointSlice 快照做静态判定
+- 切片端点 `targetRef`、拓扑路由、双栈（`dualStack`）等字段不参与判定
